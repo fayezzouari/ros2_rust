@@ -4,6 +4,7 @@
 // Further adapted from https://github.com/mvukov/rules_ros2/pull/371
 
 use std::{
+    cell::RefCell,
     collections::HashMap,
     ffi::CString,
     sync::{Mutex, OnceLock},
@@ -96,12 +97,16 @@ macro_rules! log {
                 return;
             }
 
+            let logger_name = params.get_logger_name();
+            let severity = params.get_severity();
+
+            if !$crate::impl_log_enabled(severity, logger_name) {
+                return;
+            }
+
             let mut first_time = false;
             static REMEMBER_FIRST_TIME: Once = Once::new();
             REMEMBER_FIRST_TIME.call_once(|| first_time = true);
-
-            let logger_name = params.get_logger_name();
-            let severity = params.get_severity();
 
             match params.get_occurence() {
                 // Create the static variables here so we get a per-instance static
@@ -305,6 +310,40 @@ macro_rules! log_unconditional {
             }
         }
     }}
+}
+
+/// Checks whether a log with this severity would be output by the logger.
+/// Don't call this directly, use the logging macros instead, i.e. [`log`].
+#[doc(hidden)]
+pub fn impl_log_enabled(severity: LogSeverity, logger_name: &LoggerName) -> bool {
+    let severity = severity.as_native() as i32;
+    let is_enabled = |c_name: &CString| unsafe {
+        // SAFETY: c_name is a valid null-terminated string for the duration of the call.
+        rcutils_logging_logger_is_enabled_for(c_name.as_ptr(), severity)
+    };
+
+    match logger_name {
+        LoggerName::Validated(c_name) => is_enabled(c_name),
+        LoggerName::Unvalidated(str_name) => {
+            thread_local! {
+                static NAMES: RefCell<HashMap<String, CString>> = RefCell::default();
+            }
+            NAMES.with_borrow_mut(|names| {
+                if let Some(c_name) = names.get(*str_name) {
+                    return is_enabled(c_name);
+                }
+                match CString::new(*str_name) {
+                    Ok(c_name) => {
+                        let enabled = is_enabled(&c_name);
+                        names.insert(str_name.to_string(), c_name);
+                        enabled
+                    }
+                    // Let impl_log report the invalid logger name.
+                    Err(_) => true,
+                }
+            })
+        }
+    }
 }
 
 /// Calls the underlying rclutils logging function
